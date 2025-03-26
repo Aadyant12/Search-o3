@@ -12,6 +12,7 @@ import argparse
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
+from sentence_transformers import SentenceTransformer, util
 
 from bing_search import (
     bing_web_search, 
@@ -171,6 +172,46 @@ def parse_args():
         help="Bing Search API endpoint."
     )
 
+    # Enhanced HyDE configuration
+    parser.add_argument(
+        '--use_hyde',
+        action='store_true',
+        help="Whether to use Hypothetical Document Embeddings for search enhancement."
+    )
+    
+    parser.add_argument(
+        '--embedding_model',
+        type=str,
+        default='sentence-transformers/all-mpnet-base-v2',
+        help="Embedding model to use for HyDE."
+    )
+    
+    parser.add_argument(
+        '--hyde_temperature',
+        type=float,
+        default=0.7,
+        help="Temperature for generating hypothetical documents."
+    )
+    
+    parser.add_argument(
+        '--num_hyde_docs',
+        type=int,
+        default=3,
+        help="Number of hypothetical documents to generate for ensemble."
+    )
+    
+    parser.add_argument(
+        '--context_aware_hyde',
+        action='store_true',
+        help="Whether to use context-aware HyDE."
+    )
+    
+    parser.add_argument(
+        '--adaptive_ensemble',
+        action='store_true',
+        help="Whether to use adaptive ensemble of hypothetical documents."
+    )
+
     return parser.parse_args()
 
 def main():
@@ -194,6 +235,14 @@ def main():
     bing_endpoint = args.bing_endpoint
     use_jina = args.use_jina
     jina_api_key = args.jina_api_key
+    
+    # Extract HyDE arguments
+    use_hyde = args.use_hyde
+    embedding_model_name = args.embedding_model
+    hyde_temperature = args.hyde_temperature
+    num_hyde_docs = args.num_hyde_docs
+    context_aware_hyde = args.context_aware_hyde
+    adaptive_ensemble = args.adaptive_ensemble
     
     # Adjust parameters based on dataset
     if dataset_name in ['nq', 'triviaqa', 'hotpotqa', 'musique', 'bamboogle', '2wiki', 'medmcqa', 'pubhealth']:
@@ -277,6 +326,14 @@ def main():
         tensor_parallel_size=torch.cuda.device_count(),
         gpu_memory_utilization=0.95,
     )
+
+    # Initialize embedding model if HyDE is enabled
+    if use_hyde:
+        print(f"Initializing embedding model {embedding_model_name} for Weighted HyDE...")
+        embedding_model = SentenceTransformer(embedding_model_name)
+        print(f"Context-aware HyDE: {context_aware_hyde}")
+        print(f"Adaptive ensemble: {adaptive_ensemble}")
+        print(f"Number of hypothetical documents: {num_hyde_docs}")
 
     # ---------------------- Data Loading ----------------------
     with open(data_path, 'r', encoding='utf-8') as json_file:
@@ -532,17 +589,39 @@ def main():
                 if search_query and seq['output'].rstrip().endswith(END_SEARCH_QUERY):
                     if seq['search_count'] < MAX_SEARCH_LIMIT and search_query not in seq['executed_search_queries']:
                         # Execute search, use cache if available
-                        if search_query in search_cache:
-                            results = search_cache[search_query]
+                        cache_key = f"{search_query}_{use_hyde}_{context_aware_hyde}_{adaptive_ensemble}"
+                        if cache_key in search_cache:
+                            results = search_cache[cache_key]
                             print(f"Using cached search results for query: \"{search_query}\"")
                         else:
                             try:
-                                results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
-                                search_cache[search_query] = results
+                                if use_hyde:
+                                    # Extract reasoning context for context-aware HyDE
+                                    reasoning_context = seq['output']
+                                    
+                                    results = enhanced_bing_search(
+                                        search_query,
+                                        reasoning_context,
+                                        bing_subscription_key, 
+                                        bing_endpoint, 
+                                        llm=llm,
+                                        tokenizer=tokenizer,
+                                        embedding_model=embedding_model,
+                                        use_hyde=use_hyde,
+                                        context_aware=context_aware_hyde,
+                                        adaptive_ensemble=adaptive_ensemble,
+                                        num_docs=num_hyde_docs,
+                                        hyde_temperature=hyde_temperature,
+                                        top_k=top_k
+                                    )
+                                else:
+                                    results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                                
+                                search_cache[cache_key] = results
                                 print(f"Executed and cached search for query: \"{search_query}\"")
                             except Exception as e:
                                 print(f"Error during search query '{search_query}': {e}")
-                                search_cache[search_query] = {}
+                                search_cache[cache_key] = {}
                                 results = {}
 
                         # Extract relevant information from Bing search results
