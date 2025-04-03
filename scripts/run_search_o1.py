@@ -340,6 +340,7 @@ def main():
         model=model_path,
         tensor_parallel_size=torch.cuda.device_count(),
         gpu_memory_utilization=0.95,
+        dtype="float16",
     )
 
     # Initialize embedding model if HyDE is enabled
@@ -614,11 +615,10 @@ def main():
                                     # Extract reasoning context for context-aware HyDE
                                     reasoning_context = seq['output']
                                     
-                                    results = enhanced_bing_search(
+                                    results = enhanced_google_search(
                                         search_query,
                                         reasoning_context,
-                                        bing_subscription_key, 
-                                        bing_endpoint, 
+                                        google_subscription_key, 
                                         llm=llm,
                                         tokenizer=tokenizer,
                                         embedding_model=embedding_model,
@@ -630,7 +630,6 @@ def main():
                                         top_k=top_k
                                     )
                                 else:
-                                    # results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
                                     results = google_web_search(search_query, google_subscription_key)
                                 
                                 search_cache[cache_key] = results
@@ -640,13 +639,13 @@ def main():
                                 search_cache[cache_key] = {}
                                 results = {}
 
-                        # Extract relevant information from Bing search results
+                        # Extract relevant information from Google search results
                         relevant_info = extract_relevant_info(results)[:top_k]
                         seq['relevant_info'] = relevant_info
 
                         # Extract URLs and snippets
-                        urls_to_fetch = [it['url'] for it in relevant_info]
-                        snippets = {info['url']: info['snippet'] for info in relevant_info if 'snippet' in info}
+                        urls_to_fetch = [it['link'] for it in relevant_info]
+                        snippets = {info['link']: info['snippet'] for info in relevant_info if 'snippet' in info}
 
                         # Filter URLs that are not cached
                         urls_to_fetch_filtered = [u for u in urls_to_fetch if u not in url_cache]
@@ -729,7 +728,7 @@ def main():
             for relevant_info in batch_relevant_info:
                 formatted_documents = ""
                 for i, doc_info in enumerate(relevant_info):
-                    url = doc_info['url']
+                    url = doc_info['link']
                     raw_context = url_cache.get(url, "")
                     doc_info['snippet'] = doc_info['snippet'].replace('<b>','').replace('</b>','')            
                     success, filtered_context = extract_snippet_with_context(raw_context, doc_info['snippet'], context_chars=max_doc_len)
@@ -819,6 +818,298 @@ def main():
     save_caches()
 
     print("Process completed.")
+
+def extract_uncertainty(reasoning_context):
+    """
+    Extract uncertainty markers and surrounding context from the reasoning chain.
+    
+    Args:
+        reasoning_context: The current reasoning chain
+        
+    Returns:
+        A list of uncertainty contexts
+    """
+    # Define uncertainty markers
+    uncertainty_markers = [
+        "perhaps", "likely", "possibly", "might", "may", "could", 
+        "uncertain", "not sure", "unclear", "don't know", "unknown",
+        "need more information", "need to verify", "need to check"
+    ]
+    
+    # Find sentences containing uncertainty markers
+    sentences = re.split(r'(?<=[.!?])\s+', reasoning_context)
+    uncertainty_contexts = []
+    
+    for sentence in sentences:
+        if any(marker in sentence.lower() for marker in uncertainty_markers):
+            # Get surrounding context (previous and next sentence if available)
+            idx = sentences.index(sentence)
+            start_idx = max(0, idx - 1)
+            end_idx = min(len(sentences), idx + 2)
+            context = " ".join(sentences[start_idx:end_idx])
+            uncertainty_contexts.append(context)
+    
+    # If no uncertainty markers found, return the last few sentences as context
+    if not uncertainty_contexts and len(sentences) > 0:
+        uncertainty_contexts = [" ".join(sentences[-3:])]
+    
+    return uncertainty_contexts
+
+def generate_context_aware_hypothetical_document(llm, query, reasoning_context, tokenizer, temperature=0.7):
+    """
+    Generate a hypothetical document based on the query and reasoning context.
+    
+    Args:
+        llm: The language model
+        query: The search query
+        reasoning_context: The current reasoning chain
+        tokenizer: Tokenizer for the language model
+        temperature: Temperature for generation
+        
+    Returns:
+        A hypothetical document that addresses the knowledge gap
+    """
+    # Extract uncertainty contexts
+    uncertainty_contexts = extract_uncertainty(reasoning_context)
+    uncertainty_text = "\n".join(uncertainty_contexts)
+    
+    # Create a prompt that incorporates both the query and reasoning context
+    hyde_prompt = f"""You are an expert researcher. Generate a detailed document that would be the perfect search result for addressing the knowledge gaps in the current reasoning.
+
+Current reasoning context with uncertainty:
+{uncertainty_text}
+
+Search query: {query}
+
+Generate a detailed document that would provide the missing information:"""
+    
+    prompt = [{"role": "user", "content": hyde_prompt}]
+    prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+    
+    sampling_params = SamplingParams(
+        max_tokens=1024,
+        temperature=temperature,
+        top_p=0.9,
+        top_k=50,
+    )
+    
+    output = llm.generate(prompt, sampling_params=sampling_params)
+    hypothetical_doc = output.outputs[0].text.strip()
+    
+    return hypothetical_doc
+
+def evaluate_document_confidence(doc, query, reasoning_context, llm, tokenizer):
+    """
+    Evaluate the confidence score for a hypothetical document.
+    
+    Args:
+        doc: The hypothetical document
+        query: The search query
+        reasoning_context: The current reasoning chain
+        llm: The language model
+        tokenizer: Tokenizer for the language model
+        
+    Returns:
+        A confidence score between 0 and 1
+    """
+    eval_prompt = f"""On a scale of 0 to 10, rate how well the following document addresses the knowledge gaps in the reasoning context and answers the search query.
+
+Search query: {query}
+
+Current reasoning context (abbreviated):
+{reasoning_context[:500]}...
+
+Document to evaluate:
+{doc[:1000]}...
+
+Provide your rating as a single number between 0 and 10, where 0 means completely irrelevant and 10 means perfectly addresses the knowledge gap."""
+    
+    prompt = [{"role": "user", "content": eval_prompt}]
+    prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+    
+    sampling_params = SamplingParams(
+        max_tokens=10,
+        temperature=0.1,
+        top_p=0.95,
+    )
+    
+    output = llm.generate(prompt, sampling_params=sampling_params)
+    response = output.outputs[0].text.strip()
+    
+    # Extract the numeric rating
+    try:
+        # Try to find a number in the response
+        match = re.search(r'(\d+(\.\d+)?)', response)
+        if match:
+            rating = float(match.group(1))
+            # Normalize to 0-1 range
+            confidence = min(max(rating / 10.0, 0.0), 1.0)
+        else:
+            confidence = 0.5  # Default if no number found
+    except:
+        confidence = 0.5  # Default if parsing fails
+    
+    return confidence
+
+def generate_weighted_hyde_embeddings(query, reasoning_context, llm, tokenizer, embedding_model, 
+                                     num_docs=3, temperature=0.7, context_aware=True, adaptive_ensemble=True):
+    """
+    Generate weighted HyDE embeddings using context-aware documents and adaptive ensemble.
+    
+    Args:
+        query: The search query
+        reasoning_context: The current reasoning chain
+        llm: The language model
+        tokenizer: Tokenizer for the language model
+        embedding_model: Model for embedding documents
+        num_docs: Number of hypothetical documents to generate
+        temperature: Temperature for generation
+        context_aware: Whether to use context-aware HyDE
+        adaptive_ensemble: Whether to use adaptive ensemble
+        
+    Returns:
+        A weighted ensemble embedding
+    """
+    hypothetical_docs = []
+    
+    # Generate multiple hypothetical documents
+    for i in range(num_docs):
+        if context_aware:
+            doc = generate_context_aware_hypothetical_document(
+                llm, query, reasoning_context, tokenizer, temperature=temperature
+            )
+        else:
+            # Fall back to standard HyDE if context_aware is False
+            hyde_prompt = f"Generate a detailed document that would be the perfect search result for this query: {query}"
+            prompt = [{"role": "user", "content": hyde_prompt}]
+            prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+            
+            sampling_params = SamplingParams(
+                max_tokens=1024,
+                temperature=temperature,
+                top_p=0.9,
+                top_k=50,
+            )
+            
+            output = llm.generate(prompt, sampling_params=sampling_params)
+            doc = output.outputs[0].text.strip()
+        
+        hypothetical_docs.append(doc)
+    
+    # Compute embeddings for all documents
+    embeddings = embedding_model.encode(hypothetical_docs)
+    
+    if adaptive_ensemble and len(hypothetical_docs) > 1:
+        # Compute confidence scores for adaptive ensemble
+        confidence_scores = []
+        for doc in hypothetical_docs:
+            confidence = evaluate_document_confidence(doc, query, reasoning_context, llm, tokenizer)
+            confidence_scores.append(confidence)
+        
+        # Normalize confidence scores to sum to 1
+        total_confidence = sum(confidence_scores)
+        if total_confidence > 0:
+            weights = [score / total_confidence for score in confidence_scores]
+        else:
+            weights = [1.0 / len(confidence_scores)] * len(confidence_scores)
+        
+        # Compute weighted average embedding
+        weighted_embedding = np.zeros_like(embeddings[0])
+        for i, embedding in enumerate(embeddings):
+            weighted_embedding += weights[i] * embedding
+        
+        # Normalize the weighted embedding
+        weighted_embedding = weighted_embedding / np.linalg.norm(weighted_embedding)
+        
+        return weighted_embedding, hypothetical_docs, weights
+    else:
+        # If not using adaptive ensemble, just average the embeddings
+        average_embedding = np.mean(embeddings, axis=0)
+        average_embedding = average_embedding / np.linalg.norm(average_embedding)
+        weights = [1.0 / len(hypothetical_docs)] * len(hypothetical_docs)
+        
+        return average_embedding, hypothetical_docs, weights
+
+def enhanced_google_search(query, reasoning_context, google_subscription_key, 
+                          llm=None, tokenizer=None, embedding_model=None,
+                          use_hyde=False, context_aware=True, adaptive_ensemble=True,
+                          num_docs=3, hyde_temperature=0.7, top_k=10):
+    """
+    Perform enhanced Google search with Weighted HyDE.
+    
+    Args:
+        query: The search query
+        reasoning_context: The current reasoning chain
+        google_subscription_key: Google API key
+        llm: Language model for generating hypothetical documents
+        tokenizer: Tokenizer for the language model
+        embedding_model: Model for embedding documents
+        use_hyde: Whether to use HyDE
+        context_aware: Whether to use context-aware HyDE
+        adaptive_ensemble: Whether to use adaptive ensemble
+        num_docs: Number of hypothetical documents to generate
+        hyde_temperature: Temperature for generating hypothetical documents
+        top_k: Maximum number of search results to return
+        
+    Returns:
+        Search results
+    """
+    if not use_hyde:
+        return google_web_search(query, google_subscription_key)
+    
+    # Generate weighted HyDE embeddings
+    weighted_embedding, hypothetical_docs, weights = generate_weighted_hyde_embeddings(
+        query, reasoning_context, llm, tokenizer, embedding_model,
+        num_docs=num_docs, temperature=hyde_temperature,
+        context_aware=context_aware, adaptive_ensemble=adaptive_ensemble
+    )
+    
+    # Log the hypothetical documents and their weights for debugging
+    print(f"Generated {len(hypothetical_docs)} hypothetical documents with weights: {weights}")
+    
+    # Extract key information from hypothetical documents to create enhanced queries
+    enhanced_queries = [query]  # Start with the original query
+    
+    # Extract important sentences from hypothetical documents, weighted by confidence
+    for doc, weight in zip(hypothetical_docs, weights):
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', doc)
+        
+        # Select sentences based on weight (more sentences from higher-weighted docs)
+        num_sentences = max(1, int(round(3 * weight)))  # At least 1, up to 3 sentences based on weight
+        
+        if len(sentences) <= num_sentences:
+            selected_sentences = sentences
+        else:
+            # Simple heuristic: longer sentences might contain more information
+            selected_sentences = sorted(sentences, key=len, reverse=True)[:num_sentences]
+        
+        enhanced_queries.extend(selected_sentences)
+    
+    # Limit the number of queries to avoid excessive API calls
+    enhanced_queries = enhanced_queries[:5]  # Limit to 5 queries total
+    
+    # Perform search for each query
+    all_results = []
+    for q in enhanced_queries:
+        results = google_web_search(q, google_subscription_key)
+        if 'items' in results:  # Google Search API returns 'items' instead of 'webPages'
+            all_results.extend(results['items'])
+    
+    # Remove duplicates based on URL
+    seen_urls = set()
+    unique_results = []
+    for result in all_results:
+        if 'link' in result and result['link'] not in seen_urls:  # Google uses 'link' instead of 'url'
+            seen_urls.add(result['link'])
+            unique_results.append(result)
+    
+    # Format results to match the expected structure for Google Search API
+    combined_results = {
+        'items': unique_results[:top_k]  # Limit to top_k results
+    }
+    
+    return combined_results
 
 if __name__ == "__main__":
     main()
