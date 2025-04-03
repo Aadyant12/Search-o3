@@ -14,11 +14,17 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from sentence_transformers import SentenceTransformer, util
 
-from bing_search import (
-    bing_web_search, 
-    extract_relevant_info, 
-    fetch_page_content, 
-    extract_snippet_with_context
+# from bing_search import (
+#     bing_web_search, 
+#     extract_relevant_info, 
+#     fetch_page_content, 
+#     extract_snippet_with_context
+# )
+from google_search import (
+    google_web_search,
+    extract_relevant_info,
+    fetch_page_content,
+    extract_snippet_with_context,
 )
 from evaluate import (
     run_evaluation, 
@@ -157,19 +163,27 @@ def parse_args():
         help="Maximum number of tokens to generate. If not set, defaults based on the model and dataset."
     )
 
-    # Bing API Configuration
+    # # Bing API Configuration
+    # parser.add_argument(
+    #     '--bing_subscription_key',
+    #     type=str,
+    #     required=True,
+    #     help="Bing Search API subscription key."
+    # )
+
+    # parser.add_argument(
+    #     '--bing_endpoint',
+    #     type=str,
+    #     default="https://api.bing.microsoft.com/v7.0/search",
+    #     help="Bing Search API endpoint."
+    # )
+
+    # Google API Configuration
     parser.add_argument(
-        '--bing_subscription_key',
+        '--google_subscription_key',
         type=str,
         required=True,
-        help="Bing Search API subscription key."
-    )
-
-    parser.add_argument(
-        '--bing_endpoint',
-        type=str,
-        default="https://api.bing.microsoft.com/v7.0/search",
-        help="Bing Search API endpoint."
+        help="Google Search API key."
     )
 
     # Enhanced HyDE configuration
@@ -231,7 +245,8 @@ def main():
     top_k_sampling = args.top_k_sampling
     repetition_penalty = args.repetition_penalty
     max_tokens = args.max_tokens
-    bing_subscription_key = args.bing_subscription_key
+    # bing_subscription_key = args.bing_subscription_key
+    google_subscription_key = args.google_subscription_key
     bing_endpoint = args.bing_endpoint
     use_jina = args.use_jina
     jina_api_key = args.jina_api_key
@@ -615,7 +630,8 @@ def main():
                                         top_k=top_k
                                     )
                                 else:
-                                    results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                                    # results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                                    results = google_web_search(search_query, google_subscription_key)
                                 
                                 search_cache[cache_key] = results
                                 print(f"Executed and cached search for query: \"{search_query}\"")
