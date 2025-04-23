@@ -12,20 +12,21 @@ import argparse
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
-from sentence_transformers import SentenceTransformer, util
 
 # from bing_search import (
-#     bing_web_search, 
+#     # bing_web_search, 
 #     extract_relevant_info, 
 #     fetch_page_content, 
 #     extract_snippet_with_context
-# )
+
+
 from google_search import (
     google_web_search,
     extract_relevant_info,
     fetch_page_content,
     extract_snippet_with_context,
 )
+
 from evaluate import (
     run_evaluation, 
     extract_answer
@@ -42,6 +43,9 @@ from prompts import (
     get_task_instruction_multi_choice, 
     get_task_instruction_code, 
 )
+
+from FlagEmbedding import FlagICLModel
+import torch.nn.functional as F
 
 # Define special tokens
 BEGIN_SEARCH_QUERY = "<|begin_search_query|>"
@@ -186,47 +190,142 @@ def parse_args():
         help="Google Search API key."
     )
 
-    # Enhanced HyDE configuration
     parser.add_argument(
-        '--use_hyde',
-        action='store_true',
-        help="Whether to use Hypothetical Document Embeddings for search enhancement."
+        '--use_flag_embedding',
+        type=bool,
+        default=False,
+        help="Whether to use FlagEmbedding for improved retrieval"
     )
-    
+
     parser.add_argument(
-        '--embedding_model',
+        '--flag_model_name',
         type=str,
-        default='sentence-transformers/all-mpnet-base-v2',
-        help="Embedding model to use for HyDE."
+        default='BAAI/bge-en-icl',
+        help="FlagEmbedding model to use"
     )
-    
+
     parser.add_argument(
-        '--hyde_temperature',
-        type=float,
-        default=0.7,
-        help="Temperature for generating hypothetical documents."
-    )
-    
-    parser.add_argument(
-        '--num_hyde_docs',
-        type=int,
-        default=3,
-        help="Number of hypothetical documents to generate for ensemble."
-    )
-    
-    parser.add_argument(
-        '--context_aware_hyde',
-        action='store_true',
-        help="Whether to use context-aware HyDE."
-    )
-    
-    parser.add_argument(
-        '--adaptive_ensemble',
-        action='store_true',
-        help="Whether to use adaptive ensemble of hypothetical documents."
+        '--cache_flag_models',
+        type=bool,
+        default=True,
+        help="Whether to cache FlagEmbedding models for each category"
     )
 
     return parser.parse_args()
+
+def initialize_flag_model(model_name, category, use_fp16=True):
+    """Initialize the FlagICLModel for a specific science category."""
+    # Get examples and instruction for the category
+    examples = get_category_examples(category)
+    instruction = get_category_instruction(category)
+    
+    # Initialize model with category-specific instruction
+    model = FlagICLModel(
+        model_name,
+        query_instruction_for_retrieval=instruction,
+        examples_for_task=examples,
+        use_fp16=use_fp16
+    )
+    
+    return model
+
+def rank_documents_with_embeddings(query, documents, flag_model):
+    """Rank documents using embeddings from FlagICLModel, optimized for physics content."""
+    # Encode query
+    query_embedding = flag_model.encode_queries([query])
+    
+    # Prepare document texts for encoding - prioritize physics-related content
+    doc_texts = []
+    for doc in documents:
+        # Combine snippet and context, giving priority to physics formulas and explanations
+        text = doc.get('snippet', '') + " " + doc.get('context', '')[:1500]
+        doc_texts.append(text)
+    
+    # Encode documents
+    doc_embeddings = flag_model.encode_corpus(doc_texts)
+    
+    # Calculate similarities
+    similarity_scores = query_embedding @ doc_embeddings.T
+    
+    # Sort documents by similarity scores
+    sorted_indices = similarity_scores[0].argsort()[::-1]
+    sorted_documents = [documents[idx] for idx in sorted_indices]
+    
+    return sorted_documents
+
+def detect_question_category(question):
+    """Detect if a question is related to physics, chemistry, or biology."""
+    # Define category keywords
+    physics_keywords = ["physics", "quantum", "mechanics", "relativity", "wave", "particle", "gravity", 
+                        "force", "motion", "energy", "momentum", "electromagnetic", "nuclear", "thermodynamics"]
+    
+    chemistry_keywords = ["chemistry", "chemical", "reaction", "molecule", "atom", "bond", "compound", 
+                          "acid", "base", "solution", "organic", "inorganic", "polymer", "catalyst"]
+    
+    biology_keywords = ["biology", "cell", "gene", "protein", "enzyme", "organism", "evolution", 
+                        "ecology", "microbiology", "molecular", "DNA", "RNA", "tissue", "neuron"]
+    
+    # Count matches for each category
+    physics_count = sum(1 for keyword in physics_keywords if keyword.lower() in question.lower())
+    chemistry_count = sum(1 for keyword in chemistry_keywords if keyword.lower() in question.lower())
+    biology_count = sum(1 for keyword in biology_keywords if keyword.lower() in question.lower())
+    
+    # Determine category based on keyword count
+    if physics_count >= chemistry_count and physics_count >= biology_count:
+        return "physics"
+    elif chemistry_count >= physics_count and chemistry_count >= biology_count:
+        return "chemistry"
+    else:
+        return "biology"
+
+def get_category_examples(category):
+    """Get FlagEmbedding examples specific to a question category."""
+    
+    # Physics examples
+    physics_examples = [
+        {'instruct': 'Given a physics question, retrieve relevant passages that provide accurate scientific information.',
+         'query': 'explain quantum entanglement and its implications for quantum computing',
+         'response': "Quantum entanglement occurs when pairs or groups of particles interact in ways such that the quantum state of each particle cannot be described independently. Instead, a quantum state must be described for the system as a whole, even when particles are separated by large distances. Einstein referred to this phenomenon as 'spooky action at a distance.' In quantum computing, entanglement is a critical resource that enables quantum computers to perform certain calculations exponentially faster than classical computers. Entangled qubits allow quantum computers to explore multiple solutions simultaneously and implement quantum algorithms like Shor's algorithm for factoring large numbers and Grover's algorithm for searching unsorted databases."},
+        {'instruct': 'Given a physics question, retrieve relevant passages that provide accurate scientific information.',
+         'query': 'how do gravitational waves propagate through spacetime and what are their properties',
+         'response': "Gravitational waves are ripples in the curvature of spacetime that propagate as waves at the speed of light. They are produced by certain movements of massive objects, such as the co-orbiting of binary black holes or neutron stars. As gravitational waves propagate, they compress spacetime in one direction while stretching it in the perpendicular direction, creating a quadrupole pattern of distortion. Unlike electromagnetic waves, gravitational waves interact very weakly with matter, allowing them to travel virtually unimpeded through the universe. They carry energy and angular momentum away from their source systems. Their amplitude decreases inversely with distance from the source, and they can be characterized by their frequency, amplitude, and polarization."}
+    ]
+    
+    # Chemistry examples
+    chemistry_examples = [
+        {'instruct': 'Given a chemistry question, retrieve relevant passages that provide accurate scientific information.',
+         'query': 'explain how electronegativity affects chemical bonding and molecular properties',
+         'response': "Electronegativity is a measure of an atom's ability to attract shared electrons in a chemical bond. When atoms with different electronegativities form bonds, the shared electrons are pulled toward the more electronegative atom, creating a polar bond with partial positive and negative charges. This polarity affects molecular properties including boiling point, solubility, and reactivity. In extreme cases, when electronegativity differences are large (>1.7 on the Pauling scale), electron transfer occurs completely, forming ionic bonds. Conversely, atoms with similar electronegativities form nonpolar covalent bonds with equal electron sharing. The concept explains bond character, intermolecular forces like hydrogen bonding, and how functional groups behave in organic chemistry reactions."},
+        {'instruct': 'Given a chemistry question, retrieve relevant passages that provide accurate scientific information.',
+         'query': 'what are the mechanisms of catalysis in enzymatic reactions',
+         'response': "Enzymes catalyze biochemical reactions through several mechanisms that lower activation energy without being consumed. Proximity and orientation effects position substrates in the optimal configuration for reaction. Induced fit occurs when substrate binding causes conformational changes that bring catalytic groups into proper alignment. Enzymes can provide alternative reaction pathways involving covalent intermediates between enzyme and substrate. Many enzymes use acid-base catalysis, where amino acid residues donate or accept protons. Metal ion catalysis is common, where metals like Zn²⁺, Mg²⁺, or Fe²⁺ stabilize negative charges or act as electron acceptors. Electrostatic catalysis involves charged amino acid residues stabilizing transition states. Enzymes create microenvironments that can exclude water, alter pKa values of amino acids, and provide precise stereochemical control of reactions."}
+    ]
+    
+    # Biology examples
+    biology_examples = [
+        {'instruct': 'Given a biology question, retrieve relevant passages that provide accurate scientific information.',
+         'query': 'describe the process of DNA replication and its regulation in eukaryotic cells',
+         'response': "DNA replication in eukaryotes is a complex, highly-regulated process that occurs during the S phase of the cell cycle. It begins at multiple origins of replication where the DNA double helix is unwound by helicase enzymes, creating replication forks. DNA polymerase enzymes then synthesize new DNA strands in the 5' to 3' direction, using the original strands as templates. On the leading strand, synthesis proceeds continuously, while on the lagging strand, it occurs in short fragments (Okazaki fragments) that are later joined by DNA ligase. Regulation occurs through a multi-step process: licensing factors mark origins during G1 phase, and cyclin-dependent kinases activate these origins during S phase in a sequential manner. This prevents re-replication and ensures the genome is copied exactly once per cell cycle. Additional regulatory mechanisms include checkpoints that halt replication if DNA damage is detected, allowing repair mechanisms to function before replication continues."},
+        {'instruct': 'Given a biology question, retrieve relevant passages that provide accurate scientific information.',
+         'query': 'how do neurons transmit signals across synapses and what factors influence synaptic plasticity',
+         'response': "Neurons transmit signals across synapses through a process called synaptic transmission. When an action potential reaches the presynaptic terminal, voltage-gated calcium channels open, allowing calcium ions to enter. This triggers the release of neurotransmitters stored in synaptic vesicles into the synaptic cleft through exocytosis. These neurotransmitters diffuse across the cleft and bind to specific receptors on the postsynaptic membrane, which can be ionotropic (directly opening ion channels) or metabotropic (activating second messenger systems). This binding can generate excitatory or inhibitory postsynaptic potentials, depending on the neurotransmitter and receptor types. Synaptic plasticity—the ability of synapses to strengthen or weaken over time—is influenced by factors including the frequency and timing of synaptic activity (Hebbian plasticity), neurotrophic factors like BDNF, neuromodulators such as dopamine and acetylcholine, structural changes in dendritic spines, and gene expression changes that support long-term potentiation or depression. These mechanisms underlie learning and memory formation."}
+    ]
+    
+    if category == "physics":
+        return physics_examples
+    elif category == "chemistry":
+        return chemistry_examples
+    else:  # biology or default
+        return biology_examples
+
+def get_category_instruction(category):
+    """Get the appropriate instruction based on question category."""
+    if category == "physics":
+        return "Given a physics question, retrieve relevant passages that provide accurate scientific information."
+    elif category == "chemistry":
+        return "Given a chemistry question, retrieve relevant passages that provide accurate scientific information."
+    else:  # biology or default
+        return "Given a biology question, retrieve relevant passages that provide accurate scientific information."
 
 def main():
     args = parse_args()
@@ -246,18 +345,13 @@ def main():
     repetition_penalty = args.repetition_penalty
     max_tokens = args.max_tokens
     # bing_subscription_key = args.bing_subscription_key
+    # bing_endpoint = args.bing_endpoint
     google_subscription_key = args.google_subscription_key
-    bing_endpoint = args.bing_endpoint
     use_jina = args.use_jina
     jina_api_key = args.jina_api_key
-    
-    # Extract HyDE arguments
-    use_hyde = args.use_hyde
-    embedding_model_name = args.embedding_model
-    hyde_temperature = args.hyde_temperature
-    num_hyde_docs = args.num_hyde_docs
-    context_aware_hyde = args.context_aware_hyde
-    adaptive_ensemble = args.adaptive_ensemble
+    use_flag_embedding = args.use_flag_embedding
+    flag_model_name = args.flag_model_name
+    cache_flag_models = args.cache_flag_models
     
     # Adjust parameters based on dataset
     if dataset_name in ['nq', 'triviaqa', 'hotpotqa', 'musique', 'bamboogle', '2wiki', 'medmcqa', 'pubhealth']:
@@ -279,7 +373,7 @@ def main():
     if dataset_name == 'livecode':
         data_path = f'./data/LiveCodeBench/{split}.json'
     elif dataset_name in ['math500', 'gpqa', 'aime', 'amc']:
-        data_path = f'./data/{dataset_name.upper()}/{split}.json'
+        data_path = '/content/drive/MyDrive/search-o3/Search-o3/data/GPQA/diamond.json'
     else:
         data_path = f'./data/QA_Datasets/{dataset_name}.json'
 
@@ -339,17 +433,12 @@ def main():
     llm = LLM(
         model=model_path,
         tensor_parallel_size=torch.cuda.device_count(),
-        gpu_memory_utilization=0.95,
+        gpu_memory_utilization=0.85,
         dtype="float16",
+        enforce_eager=True,
+        max_cpu_loras=1,  # Enable CPU offloading 
+        quantization="gptq", 
     )
-
-    # Initialize embedding model if HyDE is enabled
-    if use_hyde:
-        print(f"Initializing embedding model {embedding_model_name} for Weighted HyDE...")
-        embedding_model = SentenceTransformer(embedding_model_name)
-        print(f"Context-aware HyDE: {context_aware_hyde}")
-        print(f"Adaptive ensemble: {adaptive_ensemble}")
-        print(f"Number of hypothetical documents: {num_hyde_docs}")
 
     # ---------------------- Data Loading ----------------------
     with open(data_path, 'r', encoding='utf-8') as json_file:
@@ -565,6 +654,16 @@ def main():
     start_time = time.time()
     turn = 0
 
+    # Initialize category-specific models if enabled
+    flag_models = {}
+    if use_flag_embedding and cache_flag_models:
+        print("Initializing FlagEmbedding models for all categories...")
+        flag_models = {
+            "physics": initialize_flag_model(flag_model_name, "physics"),
+            "chemistry": initialize_flag_model(flag_model_name, "chemistry"),
+            "biology": initialize_flag_model(flag_model_name, "biology")
+        }
+
     # Main loop until all sequences are finished or maximum turns reached
     while True:
         # Identify sequences that need generation
@@ -605,47 +704,42 @@ def main():
                 if search_query and seq['output'].rstrip().endswith(END_SEARCH_QUERY):
                     if seq['search_count'] < MAX_SEARCH_LIMIT and search_query not in seq['executed_search_queries']:
                         # Execute search, use cache if available
-                        cache_key = f"{search_query}_{use_hyde}_{context_aware_hyde}_{adaptive_ensemble}"
-                        if cache_key in search_cache:
-                            results = search_cache[cache_key]
+                        if search_query in search_cache:
+                            results = search_cache[search_query]
                             print(f"Using cached search results for query: \"{search_query}\"")
                         else:
                             try:
-                                if use_hyde:
-                                    # Extract reasoning context for context-aware HyDE
-                                    reasoning_context = seq['output']
-                                    
-                                    results = enhanced_google_search(
-                                        search_query,
-                                        reasoning_context,
-                                        google_subscription_key, 
-                                        llm=llm,
-                                        tokenizer=tokenizer,
-                                        embedding_model=embedding_model,
-                                        use_hyde=use_hyde,
-                                        context_aware=context_aware_hyde,
-                                        adaptive_ensemble=adaptive_ensemble,
-                                        num_docs=num_hyde_docs,
-                                        hyde_temperature=hyde_temperature,
-                                        top_k=top_k
-                                    )
-                                else:
-                                    results = google_web_search(search_query, google_subscription_key)
-                                
-                                search_cache[cache_key] = results
+                                # results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                                results = google_web_search(search_query, google_subscription_key)
+                                search_cache[search_query] = results
                                 print(f"Executed and cached search for query: \"{search_query}\"")
                             except Exception as e:
                                 print(f"Error during search query '{search_query}': {e}")
-                                search_cache[cache_key] = {}
+                                search_cache[search_query] = {}
                                 results = {}
 
-                        # Extract relevant information from Google search results
-                        relevant_info = extract_relevant_info(results)[:top_k]
+                        # If FlagEmbedding is enabled, use it to rerank documents
+                        if use_flag_embedding:
+                            # Detect question category
+                            question = seq['item']['Question']
+                            category = detect_question_category(question)
+                            print(f"Detected category '{category}' for query: \"{search_query}\"")
+                            
+                            # Get or initialize the appropriate model
+                            if cache_flag_models and category in flag_models:
+                                category_model = flag_models[category]
+                            else:
+                                category_model = initialize_flag_model(flag_model_name, category)
+                            
+                            # Rerank documents with the category-specific model
+                            print(f"Reranking documents with {category}-specific FlagEmbedding")
+                            relevant_info = rank_documents_with_embeddings(search_query, results, category_model)[:top_k]
+
                         seq['relevant_info'] = relevant_info
 
                         # Extract URLs and snippets
-                        urls_to_fetch = [it['link'] for it in relevant_info]
-                        snippets = {info['link']: info['snippet'] for info in relevant_info if 'snippet' in info}
+                        urls_to_fetch = [it['url'] for it in relevant_info]
+                        snippets = {info['url']: info['snippet'] for info in relevant_info if 'snippet' in info}
 
                         # Filter URLs that are not cached
                         urls_to_fetch_filtered = [u for u in urls_to_fetch if u not in url_cache]
@@ -728,7 +822,7 @@ def main():
             for relevant_info in batch_relevant_info:
                 formatted_documents = ""
                 for i, doc_info in enumerate(relevant_info):
-                    url = doc_info['link']
+                    url = doc_info['url']
                     raw_context = url_cache.get(url, "")
                     doc_info['snippet'] = doc_info['snippet'].replace('<b>','').replace('</b>','')            
                     success, filtered_context = extract_snippet_with_context(raw_context, doc_info['snippet'], context_chars=max_doc_len)
@@ -818,298 +912,6 @@ def main():
     save_caches()
 
     print("Process completed.")
-
-def extract_uncertainty(reasoning_context):
-    """
-    Extract uncertainty markers and surrounding context from the reasoning chain.
-    
-    Args:
-        reasoning_context: The current reasoning chain
-        
-    Returns:
-        A list of uncertainty contexts
-    """
-    # Define uncertainty markers
-    uncertainty_markers = [
-        "perhaps", "likely", "possibly", "might", "may", "could", 
-        "uncertain", "not sure", "unclear", "don't know", "unknown",
-        "need more information", "need to verify", "need to check"
-    ]
-    
-    # Find sentences containing uncertainty markers
-    sentences = re.split(r'(?<=[.!?])\s+', reasoning_context)
-    uncertainty_contexts = []
-    
-    for sentence in sentences:
-        if any(marker in sentence.lower() for marker in uncertainty_markers):
-            # Get surrounding context (previous and next sentence if available)
-            idx = sentences.index(sentence)
-            start_idx = max(0, idx - 1)
-            end_idx = min(len(sentences), idx + 2)
-            context = " ".join(sentences[start_idx:end_idx])
-            uncertainty_contexts.append(context)
-    
-    # If no uncertainty markers found, return the last few sentences as context
-    if not uncertainty_contexts and len(sentences) > 0:
-        uncertainty_contexts = [" ".join(sentences[-3:])]
-    
-    return uncertainty_contexts
-
-def generate_context_aware_hypothetical_document(llm, query, reasoning_context, tokenizer, temperature=0.7):
-    """
-    Generate a hypothetical document based on the query and reasoning context.
-    
-    Args:
-        llm: The language model
-        query: The search query
-        reasoning_context: The current reasoning chain
-        tokenizer: Tokenizer for the language model
-        temperature: Temperature for generation
-        
-    Returns:
-        A hypothetical document that addresses the knowledge gap
-    """
-    # Extract uncertainty contexts
-    uncertainty_contexts = extract_uncertainty(reasoning_context)
-    uncertainty_text = "\n".join(uncertainty_contexts)
-    
-    # Create a prompt that incorporates both the query and reasoning context
-    hyde_prompt = f"""You are an expert researcher. Generate a detailed document that would be the perfect search result for addressing the knowledge gaps in the current reasoning.
-
-Current reasoning context with uncertainty:
-{uncertainty_text}
-
-Search query: {query}
-
-Generate a detailed document that would provide the missing information:"""
-    
-    prompt = [{"role": "user", "content": hyde_prompt}]
-    prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
-    
-    sampling_params = SamplingParams(
-        max_tokens=1024,
-        temperature=temperature,
-        top_p=0.9,
-        top_k=50,
-    )
-    
-    output = llm.generate(prompt, sampling_params=sampling_params)
-    hypothetical_doc = output.outputs[0].text.strip()
-    
-    return hypothetical_doc
-
-def evaluate_document_confidence(doc, query, reasoning_context, llm, tokenizer):
-    """
-    Evaluate the confidence score for a hypothetical document.
-    
-    Args:
-        doc: The hypothetical document
-        query: The search query
-        reasoning_context: The current reasoning chain
-        llm: The language model
-        tokenizer: Tokenizer for the language model
-        
-    Returns:
-        A confidence score between 0 and 1
-    """
-    eval_prompt = f"""On a scale of 0 to 10, rate how well the following document addresses the knowledge gaps in the reasoning context and answers the search query.
-
-Search query: {query}
-
-Current reasoning context (abbreviated):
-{reasoning_context[:500]}...
-
-Document to evaluate:
-{doc[:1000]}...
-
-Provide your rating as a single number between 0 and 10, where 0 means completely irrelevant and 10 means perfectly addresses the knowledge gap."""
-    
-    prompt = [{"role": "user", "content": eval_prompt}]
-    prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
-    
-    sampling_params = SamplingParams(
-        max_tokens=10,
-        temperature=0.1,
-        top_p=0.95,
-    )
-    
-    output = llm.generate(prompt, sampling_params=sampling_params)
-    response = output.outputs[0].text.strip()
-    
-    # Extract the numeric rating
-    try:
-        # Try to find a number in the response
-        match = re.search(r'(\d+(\.\d+)?)', response)
-        if match:
-            rating = float(match.group(1))
-            # Normalize to 0-1 range
-            confidence = min(max(rating / 10.0, 0.0), 1.0)
-        else:
-            confidence = 0.5  # Default if no number found
-    except:
-        confidence = 0.5  # Default if parsing fails
-    
-    return confidence
-
-def generate_weighted_hyde_embeddings(query, reasoning_context, llm, tokenizer, embedding_model, 
-                                     num_docs=3, temperature=0.7, context_aware=True, adaptive_ensemble=True):
-    """
-    Generate weighted HyDE embeddings using context-aware documents and adaptive ensemble.
-    
-    Args:
-        query: The search query
-        reasoning_context: The current reasoning chain
-        llm: The language model
-        tokenizer: Tokenizer for the language model
-        embedding_model: Model for embedding documents
-        num_docs: Number of hypothetical documents to generate
-        temperature: Temperature for generation
-        context_aware: Whether to use context-aware HyDE
-        adaptive_ensemble: Whether to use adaptive ensemble
-        
-    Returns:
-        A weighted ensemble embedding
-    """
-    hypothetical_docs = []
-    
-    # Generate multiple hypothetical documents
-    for i in range(num_docs):
-        if context_aware:
-            doc = generate_context_aware_hypothetical_document(
-                llm, query, reasoning_context, tokenizer, temperature=temperature
-            )
-        else:
-            # Fall back to standard HyDE if context_aware is False
-            hyde_prompt = f"Generate a detailed document that would be the perfect search result for this query: {query}"
-            prompt = [{"role": "user", "content": hyde_prompt}]
-            prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
-            
-            sampling_params = SamplingParams(
-                max_tokens=1024,
-                temperature=temperature,
-                top_p=0.9,
-                top_k=50,
-            )
-            
-            output = llm.generate(prompt, sampling_params=sampling_params)
-            doc = output.outputs[0].text.strip()
-        
-        hypothetical_docs.append(doc)
-    
-    # Compute embeddings for all documents
-    embeddings = embedding_model.encode(hypothetical_docs)
-    
-    if adaptive_ensemble and len(hypothetical_docs) > 1:
-        # Compute confidence scores for adaptive ensemble
-        confidence_scores = []
-        for doc in hypothetical_docs:
-            confidence = evaluate_document_confidence(doc, query, reasoning_context, llm, tokenizer)
-            confidence_scores.append(confidence)
-        
-        # Normalize confidence scores to sum to 1
-        total_confidence = sum(confidence_scores)
-        if total_confidence > 0:
-            weights = [score / total_confidence for score in confidence_scores]
-        else:
-            weights = [1.0 / len(confidence_scores)] * len(confidence_scores)
-        
-        # Compute weighted average embedding
-        weighted_embedding = np.zeros_like(embeddings[0])
-        for i, embedding in enumerate(embeddings):
-            weighted_embedding += weights[i] * embedding
-        
-        # Normalize the weighted embedding
-        weighted_embedding = weighted_embedding / np.linalg.norm(weighted_embedding)
-        
-        return weighted_embedding, hypothetical_docs, weights
-    else:
-        # If not using adaptive ensemble, just average the embeddings
-        average_embedding = np.mean(embeddings, axis=0)
-        average_embedding = average_embedding / np.linalg.norm(average_embedding)
-        weights = [1.0 / len(hypothetical_docs)] * len(hypothetical_docs)
-        
-        return average_embedding, hypothetical_docs, weights
-
-def enhanced_google_search(query, reasoning_context, google_subscription_key, 
-                          llm=None, tokenizer=None, embedding_model=None,
-                          use_hyde=False, context_aware=True, adaptive_ensemble=True,
-                          num_docs=3, hyde_temperature=0.7, top_k=10):
-    """
-    Perform enhanced Google search with Weighted HyDE.
-    
-    Args:
-        query: The search query
-        reasoning_context: The current reasoning chain
-        google_subscription_key: Google API key
-        llm: Language model for generating hypothetical documents
-        tokenizer: Tokenizer for the language model
-        embedding_model: Model for embedding documents
-        use_hyde: Whether to use HyDE
-        context_aware: Whether to use context-aware HyDE
-        adaptive_ensemble: Whether to use adaptive ensemble
-        num_docs: Number of hypothetical documents to generate
-        hyde_temperature: Temperature for generating hypothetical documents
-        top_k: Maximum number of search results to return
-        
-    Returns:
-        Search results
-    """
-    if not use_hyde:
-        return google_web_search(query, google_subscription_key)
-    
-    # Generate weighted HyDE embeddings
-    weighted_embedding, hypothetical_docs, weights = generate_weighted_hyde_embeddings(
-        query, reasoning_context, llm, tokenizer, embedding_model,
-        num_docs=num_docs, temperature=hyde_temperature,
-        context_aware=context_aware, adaptive_ensemble=adaptive_ensemble
-    )
-    
-    # Log the hypothetical documents and their weights for debugging
-    print(f"Generated {len(hypothetical_docs)} hypothetical documents with weights: {weights}")
-    
-    # Extract key information from hypothetical documents to create enhanced queries
-    enhanced_queries = [query]  # Start with the original query
-    
-    # Extract important sentences from hypothetical documents, weighted by confidence
-    for doc, weight in zip(hypothetical_docs, weights):
-        # Split into sentences
-        sentences = re.split(r'(?<=[.!?])\s+', doc)
-        
-        # Select sentences based on weight (more sentences from higher-weighted docs)
-        num_sentences = max(1, int(round(3 * weight)))  # At least 1, up to 3 sentences based on weight
-        
-        if len(sentences) <= num_sentences:
-            selected_sentences = sentences
-        else:
-            # Simple heuristic: longer sentences might contain more information
-            selected_sentences = sorted(sentences, key=len, reverse=True)[:num_sentences]
-        
-        enhanced_queries.extend(selected_sentences)
-    
-    # Limit the number of queries to avoid excessive API calls
-    enhanced_queries = enhanced_queries[:5]  # Limit to 5 queries total
-    
-    # Perform search for each query
-    all_results = []
-    for q in enhanced_queries:
-        results = google_web_search(q, google_subscription_key)
-        if 'items' in results:  # Google Search API returns 'items' instead of 'webPages'
-            all_results.extend(results['items'])
-    
-    # Remove duplicates based on URL
-    seen_urls = set()
-    unique_results = []
-    for result in all_results:
-        if 'link' in result and result['link'] not in seen_urls:  # Google uses 'link' instead of 'url'
-            seen_urls.add(result['link'])
-            unique_results.append(result)
-    
-    # Format results to match the expected structure for Google Search API
-    combined_results = {
-        'items': unique_results[:top_k]  # Limit to top_k results
-    }
-    
-    return combined_results
 
 if __name__ == "__main__":
     main()
