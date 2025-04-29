@@ -339,11 +339,10 @@ def main():
     llm = LLM(
         model=model_path,
         tensor_parallel_size=torch.cuda.device_count(),
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=0.95,
         dtype="float16",
         enforce_eager=True,
         max_cpu_loras=1,  # Enable CPU offloading 
-        quantization="gptq", 
     )
 
     # Initialize embedding model if HyDE is enabled

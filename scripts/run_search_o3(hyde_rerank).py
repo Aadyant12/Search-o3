@@ -470,31 +470,22 @@ def main():
 
     # ---------------------- Generation Function ----------------------
     def run_generation(sequences: List[Dict], max_tokens: int) -> List:
-        batch_size = 32  # Choose a smaller batch size
-        all_outputs = []
+        prompts = [s['prompt'] for s in sequences]
         
-        for i in range(0, len(sequences), batch_size):
-            batch_sequences = sequences[i:i+batch_size]
-            batch_prompts = [s['prompt'] for s in batch_sequences]
-            
-            sampling_params = SamplingParams(
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k_sampling,
-                repetition_penalty=repetition_penalty,
-                stop=[END_SEARCH_QUERY, tokenizer.eos_token],
-                include_stop_str_in_output=True,
-            )
-            
-            print(f"Processing batch {i//batch_size + 1}/{(len(sequences) + batch_size - 1)//batch_size} ({len(batch_prompts)} sequences)")
-            batch_outputs = llm.generate(batch_prompts, sampling_params=sampling_params)
-            all_outputs.extend(batch_outputs)
-            
-            # Optional: Clear cache between batches
-            torch.cuda.empty_cache()
-            
-        return all_outputs  
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k_sampling,
+            repetition_penalty=repetition_penalty,
+            stop=[END_SEARCH_QUERY, tokenizer.eos_token],
+            include_stop_str_in_output=True,
+        )
+        
+        print(f"Processing {len(prompts)} sequences")
+        outputs = llm.generate(prompts, sampling_params=sampling_params)
+        
+        return outputs
 
     # Function to extract text between two tags
     def extract_between(text: str, start_tag: str, end_tag: str) -> Optional[str]:
